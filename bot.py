@@ -13,13 +13,16 @@ dp = Dispatcher()
 
 balances = {}
 
-# Короткі коди для callback_data (економимо байти)
+# Зберігаємо уточнення: { "inline_message_id": "в губи" }
+pending_details = {}
+
 ACTIONS = {
-    "h": {"name": "обійняти",   "emoji": "🤗", "past": "обійняв(ла)"},
-    "k": {"name": "поцілувати", "emoji": "💋", "past": "поцілував(ла)"},
-    "p": {"name": "вдарити",    "emoji": "👊", "past": "вдарив(ла)"},
-    "s": {"name": "погладити",  "emoji": "🖐️", "past": "погладив(ла)"},
-    "u": {"name": "обнятися",   "emoji": "🫂", "past": "обнявся(лась) з"},
+    "h": {"name": "обійняти",   "emoji": "🤗", "past": "обійняв(ла)",     "prep": ""},
+    "k": {"name": "поцілувати", "emoji": "💋", "past": "поцілував(ла)",   "prep": "в "},
+    "p": {"name": "вдарити",    "emoji": "👊", "past": "вдарив(ла)",      "prep": "в "},
+    "s": {"name": "погладити",  "emoji": "🖐️", "past": "погладив(ла)",    "prep": "по "},
+    "u": {"name": "обнятися",   "emoji": "🫂", "past": "обнявся(лась) з", "prep": ""},
+    "i": {"name": "трахнути",   "emoji": "🔞", "past": "трахнув(ла)",     "prep": ""}
 }
 
 # ─── СТАРТ ──────────────────────────────────
@@ -28,7 +31,9 @@ ACTIONS = {
 async def start(message: types.Message):
     await message.reply(
         "🇺🇦 Вітаю! Я український RP-бот.\n\n"
-        "В будь-якому чаті напиши @ukrrp_Pero_bot і обери дію з меню!"
+        "В будь-якому чаті напиши @ukrrp_Pero_bot і обери дію з меню!\n\n"
+        "💡 Можна додати уточнення:\n"
+        "@ukrrp_Pero_bot в губи → обираєш поцілувати"
     )
 
 # ─── INLINE QUERY ────────────────────────────
@@ -36,21 +41,31 @@ async def start(message: types.Message):
 @dp.inline_query()
 async def inline_query(query: types.InlineQuery):
     user = query.from_user
-    # Скорочуємо ім'я до 10 символів щоб не перевищити 64 байти
     short_name = user.first_name[:10]
+    user_text = query.query.strip()
+
     results = []
 
     for code, data in ACTIONS.items():
         emoji = data["emoji"]
         action_name = data["name"]
-        # callback_data: "rp|a|h|123456789|Олександр|0"  — вкладається в 64 байти
+        prep = data["prep"]
+
+        if user_text:
+            detail = user_text[:30]
+            display_text = f"{emoji} {user.first_name} хоче {action_name} {prep}{detail}!"
+            desc = f"{emoji} {action_name} {prep}{detail}"
+        else:
+            display_text = f"{emoji} {user.first_name} хоче {action_name}!"
+            desc = f"Наприклад: @бот {action_name} {prep}в щоку"
+
         results.append(
             InlineQueryResultArticle(
                 id=code,
                 title=f"{emoji} {action_name.capitalize()}",
-                description=f"Надіслати запит на {action_name}",
+                description=desc,
                 input_message_content=InputTextMessageContent(
-                    message_text=f"{emoji} {user.first_name} хоче {action_name}!"
+                    message_text=display_text
                 ),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [
@@ -80,6 +95,14 @@ async def inline_query(query: types.InlineQuery):
 
     await query.answer(results, cache_time=0, is_personal=True)
 
+# ─── CHOSEN INLINE RESULT — зберігаємо уточнення ───
+
+@dp.chosen_inline_result()
+async def chosen_inline(result: types.ChosenInlineResult):
+    if result.inline_message_id and result.query.strip():
+        # Зберігаємо уточнення прив'язане до повідомлення
+        pending_details[result.inline_message_id] = result.query.strip()[:30]
+
 # ─── ОБРОБКА КНОПОК ─────────────────────────
 
 @dp.callback_query(F.data.startswith("rp|"))
@@ -98,24 +121,32 @@ async def rp_callback(callback: types.CallbackQuery):
         await callback.answer("⛔ Ця дія адресована іншій людині!", show_alert=True)
         return
 
-    data = ACTIONS.get(code, {"emoji": "✨", "past": code, "name": code})
+    data = ACTIONS.get(code, {"emoji": "✨", "past": code, "name": code, "prep": ""})
     emoji = data["emoji"]
     past = data["past"]
+    prep = data["prep"]
     responder_name = callback.from_user.first_name
+
+    # Дістаємо збережене уточнення
+    detail = pending_details.get(callback.inline_message_id, "")
+    detail_text = f" {prep}{detail}" if detail else ""
 
     if result == "a":
         await bot.edit_message_text(
             inline_message_id=callback.inline_message_id,
-            text=f"{emoji} {initiator_name} {past} {responder_name}!"
+            text=f"{emoji} {initiator_name} {past} {responder_name}{detail_text}!"
         )
         await callback.answer("Ти прийняв(ла)! 🎉")
+        # Видаляємо з пам'яті після використання
+        pending_details.pop(callback.inline_message_id, None)
 
     elif result == "d":
         await bot.edit_message_text(
             inline_message_id=callback.inline_message_id,
-            text=f"😔 {responder_name} відхилив(ла) пропозицію від {initiator_name}."
+            text=f"😔 {responder_name} відхилив(ла) пропозицію від {initiator_name}. ❌"
         )
         await callback.answer("Ти відхилив(ла).")
+        pending_details.pop(callback.inline_message_id, None)
 
 # ─── БАЛАНС / РОБОТА ─────────────────────────
 
