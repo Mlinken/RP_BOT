@@ -24,21 +24,10 @@ ACTIONS = {
     "u": {"name": "обнятися",   "emoji": "🫂", "past": "обнявся(лась) з", "prep": ""},
     "i": {"name": "трахнути",   "emoji": "🔞", "past": "трахнув(ла)",     "prep": ""},
     "o": {"name": "потрогати",  "emoji": "🫴", "past": "потрогав(ла)",    "prep": ""},
-    "l": {"name": "запустити рекету на московію",   "emoji": "🚀", "past": "запустив(ла) ракету на московію",    "prep": ""},
+    "f": {"name": "запустити",  "emoji": "🚀", "past": "запустив(ла)",    "prep": "", "illusion": True},
 }
 
 # ─── СТАРТ ──────────────────────────────────
-
-@dp.message(Command("start"))
-async def start(message: types.Message):
-    await message.reply(
-        "🇺🇦 Вітаю! Я український RP-бот.\n\n"
-        "В будь-якому чаті напиши @ukrrp_Pero_bot і обери дію з меню!\n\n"
-        "💡 Можна додати уточнення:\n"
-        "@ukrrp_Pero_bot в губи → обираєш поцілувати"
-    )
-
-# ─── INLINE QUERY ────────────────────────────
 
 @dp.inline_query()
 async def inline_query(query: types.InlineQuery):
@@ -52,14 +41,43 @@ async def inline_query(query: types.InlineQuery):
         emoji = data["emoji"]
         action_name = data["name"]
         prep = data["prep"]
+        is_illusion = data.get("illusion", False)
 
         if user_text:
             detail = user_text[:30]
-            display_text = f"{emoji} {user.first_name} хоче {action_name} {prep}{detail}!"
+            display_text = f"{emoji} {user.first_name} пропонує вам {action_name} {prep}{detail}!" if is_illusion else f"{emoji} {user.first_name} хоче {action_name} {prep}{detail}!"
             desc = f"{emoji} {action_name} {prep}{detail}"
         else:
-            display_text = f"{emoji} {user.first_name} хоче {action_name}!"
-            desc = f"Наприклад: @бот {action_name} {prep}в щоку"
+            display_text = f"{emoji} {user.first_name} пропонує вам {action_name}!" if is_illusion else f"{emoji} {user.first_name} хоче {action_name}!"
+            desc = f"Наприклад: @бот {action_name} {prep}щось"
+
+        if is_illusion:
+            # Обидві кнопки погоджувальні
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Погодитись",
+                        callback_data=f"rp|a|{code}|{user.id}|{short_name}|0"
+                    ),
+                    InlineKeyboardButton(
+                        text="☑️ Звісно",
+                        callback_data=f"rp|a|{code}|{user.id}|{short_name}|0"
+                    )
+                ]
+            ])
+        else:
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Прийняти",
+                        callback_data=f"rp|a|{code}|{user.id}|{short_name}|0"
+                    ),
+                    InlineKeyboardButton(
+                        text="❌ Відхилити",
+                        callback_data=f"rp|d|{code}|{user.id}|{short_name}|0"
+                    )
+                ]
+            ])
 
         results.append(
             InlineQueryResultArticle(
@@ -69,18 +87,7 @@ async def inline_query(query: types.InlineQuery):
                 input_message_content=InputTextMessageContent(
                     message_text=display_text
                 ),
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="✅ Прийняти",
-                            callback_data=f"rp|a|{code}|{user.id}|{short_name}|0"
-                        ),
-                        InlineKeyboardButton(
-                            text="❌ Відхилити",
-                            callback_data=f"rp|d|{code}|{user.id}|{short_name}|0"
-                        )
-                    ]
-                ])
+                reply_markup=markup
             )
         )
 
@@ -97,15 +104,6 @@ async def inline_query(query: types.InlineQuery):
 
     await query.answer(results, cache_time=0, is_personal=True)
 
-# ─── CHOSEN INLINE RESULT — зберігаємо уточнення ───
-
-@dp.chosen_inline_result()
-async def chosen_inline(result: types.ChosenInlineResult):
-    if result.inline_message_id and result.query.strip():
-        # Зберігаємо уточнення прив'язане до повідомлення
-        pending_details[result.inline_message_id] = result.query.strip()[:30]
-
-# ─── ОБРОБКА КНОПОК ─────────────────────────
 
 @dp.callback_query(F.data.startswith("rp|"))
 async def rp_callback(callback: types.CallbackQuery):
@@ -114,12 +112,14 @@ async def rp_callback(callback: types.CallbackQuery):
 
     initiator_id = int(initiator_id)
     target_id_int = int(target_id)
+    is_illusion = ACTIONS.get(code, {}).get("illusion", False)
 
+    # Для ілюзії вибору — ініціатор не може натискати сам на себе
     if callback.from_user.id == initiator_id:
         await callback.answer("🙃 Ти не можеш відповісти на власний запит!", show_alert=True)
         return
 
-    if target_id_int != 0 and callback.from_user.id != target_id_int:
+    if not is_illusion and target_id_int != 0 and callback.from_user.id != target_id_int:
         await callback.answer("⛔ Ця дія адресована іншій людині!", show_alert=True)
         return
 
@@ -129,18 +129,23 @@ async def rp_callback(callback: types.CallbackQuery):
     prep = data["prep"]
     responder_name = callback.from_user.first_name
 
-    # Дістаємо збережене уточнення
-    detail = pending_details.get(callback.inline_message_id, "")
-    detail_text = f" {prep}{detail}" if detail else ""
+    # Дістаємо уточнення з тексту повідомлення
+    detail_text = ""
+    if callback.message:
+        msg_text = callback.message.text
+        action_name = data["name"]
+        trigger = f"{action_name} {prep}" if prep else f"{action_name} "
+        if trigger in msg_text:
+            after = msg_text.split(trigger)[-1].rstrip("!")
+            if after:
+                detail_text = f" {prep}{after}" if prep else f" {after}"
 
     if result == "a":
         await bot.edit_message_text(
             inline_message_id=callback.inline_message_id,
-            text=f"{emoji} {initiator_name} {past} {responder_name}{detail_text}!"
+            text=f"{emoji} {responder_name} {past}{detail_text}! ✅"
         )
-        await callback.answer("Ти прийняв(ла)! 🎉")
-        # Видаляємо з пам'яті після використання
-        pending_details.pop(callback.inline_message_id, None)
+        await callback.answer("✅ Прийнято!")
 
     elif result == "d":
         await bot.edit_message_text(
@@ -148,29 +153,3 @@ async def rp_callback(callback: types.CallbackQuery):
             text=f"😔 {responder_name} відхилив(ла) пропозицію від {initiator_name}. ❌"
         )
         await callback.answer("Ти відхилив(ла).")
-        pending_details.pop(callback.inline_message_id, None)
-
-# ─── БАЛАНС / РОБОТА ─────────────────────────
-
-@dp.message(Command("баланс"))
-async def balance(message: types.Message):
-    user_id = message.from_user.id
-    if user_id not in balances:
-        balances[user_id] = 0
-    await message.reply(f"💰 Ваш баланс: {balances[user_id]} монет")
-
-@dp.message(Command("працювати"))
-async def work(message: types.Message):
-    user_id = message.from_user.id
-    if user_id not in balances:
-        balances[user_id] = 0
-    balances[user_id] += 50
-    await message.reply("💼 Ви попрацювали та отримали 50 монет!")
-
-# ─── ЗАПУСК ──────────────────────────────────
-
-async def main():
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
