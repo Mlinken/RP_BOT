@@ -1,6 +1,8 @@
 import asyncio
 import sqlite3
 import random
+import json
+import os
 from datetime import date
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -11,17 +13,18 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from groq import Groq
 
 TOKEN = "8587796773:AAHuFhOdn4UWATLSHS3k1eGdolw2VhfIpLo"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "твій_groq_ключ_для_тесту_локально")
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 pending_details = {}
-# Зберігаємо вибори в КНП: { inline_message_id: {user_id: choice} }
 rps_games = {}
-# Зберігаємо правда або дія: { inline_message_id: {initiator_id, initiator_name} }
 tod_games = {}
 
 # ─── FSM ─────────────────────────────────────
@@ -29,6 +32,10 @@ tod_games = {}
 class AddAction(StatesGroup):
     waiting_for_type = State()
     waiting_for_data = State()
+
+class AddTod(StatesGroup):
+    waiting_for_type = State()
+    waiting_for_text = State()
 
 # ─── БАЗА ДАНИХ ──────────────────────────────
 
@@ -52,6 +59,14 @@ def init_db():
             past TEXT,
             emoji TEXT,
             illusion INTEGER DEFAULT 0
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tod_custom (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            type TEXT,
+            text TEXT
         )
     """)
     try:
@@ -151,7 +166,75 @@ def list_custom_actions(user_id):
     conn.close()
     return rows
 
-# ─── СТАНДАРТНІ РП ДІЇ ───────────────────────
+def get_tod_tasks(task_type: str):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT text FROM tod_custom WHERE type = ?", (task_type,))
+    rows = [row[0] for row in c.fetchall()]
+    conn.close()
+    return rows
+
+def add_tod_task(user_id: int, task_type: str, text: str):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO tod_custom (user_id, type, text) VALUES (?, ?, ?)",
+        (user_id, task_type, text)
+    )
+    conn.commit()
+    conn.close()
+
+def list_tod_tasks(user_id: int):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT id, type, text FROM tod_custom WHERE user_id = ?", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def delete_tod_task(user_id: int, task_id: int):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM tod_custom WHERE id = ? AND user_id = ?", (task_id, user_id))
+    deleted = c.rowcount
+    conn.commit()
+    conn.close()
+    return deleted > 0
+
+# ─── МОДЕРАЦІЯ ЧЕРЕЗ GROQ ────────────────────
+
+BANNED_WORDS = ["вбийся", "поріж себе", "повісься", "нашкодь собі", "отруй себе"]
+
+def simple_moderate(text: str) -> tuple[bool, str]:
+    text_lower = text.lower()
+    for word in BANNED_WORDS:
+        if word in text_lower:
+            return False, "Містить заборонений контент"
+    return True, ""
+
+async def moderate_task(text: str) -> tuple[bool, str]:
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama3-8b-8192",
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Ти модератор гри 'Правда або Дія'. Перевір це завдання:\n"
+                    f"\"{text}\"\n\n"
+                    f"ЗАБОРОНЕНО: заклики до самопошкодження, насильства, незаконних дій\n"
+                    f"ДОЗВОЛЕНО: еротика в розумних межах, незручні питання, смішні завдання\n\n"
+                    f"Відповідай ТІЛЬКИ у форматі JSON без пояснень:\n"
+                    f"{{\"allowed\": true/false, \"reason\": \"причина якщо заборонено\"}}"
+                )
+            }]
+        )
+        result = json.loads(response.choices[0].message.content.strip())
+        return result["allowed"], result.get("reason", "")
+    except Exception:
+        return simple_moderate(text)
+
+# ─── СТАНДАРТНІ ДІЇ ──────────────────────────
 
 RP_ACTIONS = {
     "h": {"name": "обійняти",   "emoji": "🤗", "past": "обійняв(ла)",     "prep": ""},
@@ -163,6 +246,22 @@ RP_ACTIONS = {
     "o": {"name": "потрогати",  "emoji": "🫴", "past": "потрогав(ла)",    "prep": ""},
     "f": {"name": "запустити",  "emoji": "🚀", "past": "запустив(ла)",    "prep": "", "illusion": True},
 }
+
+TOD_TRUTHS = [
+    "Яка твоя найбільша таємниця?",
+    "Кого з присутніх ти вважаєш найрозумнішим?",
+    "Що ти ніколи не скажеш батькам?",
+    "Твій найбільш незручний момент?",
+    "Яка твоя найстрашніша фобія?",
+]
+
+TOD_DARES = [
+    "Напиши повідомлення першому контакту в телефоні",
+    "Зроби 10 присідань прямо зараз",
+    "Напиши щось смішне на своїй сторінці",
+    "Розкажи анекдот",
+    "Проспівай будь-яку пісню",
+]
 
 # ─── СТАРТ ──────────────────────────────────
 
@@ -176,16 +275,20 @@ async def start(message: types.Message):
         "@ukrrp_Pero_bot гра кнп\n"
         "@ukrrp_Pero_bot гра правда або дія\n\n"
         "─── Свої команди ───\n"
-        "/add — додати команду\n"
-        "/my — мої команди\n"
-        "/delete — видалити команду\n"
+        "/add — додати РП команду\n"
+        "/my — мої РП команди\n"
+        "/delete — видалити РП команду\n"
         "/upgrade — +1 ліміт (100 монет)\n\n"
+        "─── Правда або Дія ───\n"
+        "/tod_add — додати питання/завдання (200 монет)\n"
+        "/tod_my — мої питання та завдання\n"
+        "/tod_delete — видалити питання або завдання\n\n"
         "─── Економіка ───\n"
         "/balance — баланс\n"
-        "/daily — щоденна нагорода\n\n"
+        "/daily — щоденна нагорода (+10 монет)\n\n"
         "─── Ігри ───\n"
-        "/casino <ставка>\n"
-        "/roulette <ставка>"
+        "/casino <ставка> — казино\n"
+        "/roulette <ставка> — рулетка"
     )
 
 # ─── ЩОДЕННА НАГОРОДА ────────────────────────
@@ -215,7 +318,7 @@ async def balance(message: types.Message):
     user = get_user(user_id)
     await message.reply(
         f"💰 Баланс: {user['balance']} монет\n"
-        f"📋 Команди: {count_custom_actions(user_id)}/{user['limit']}\n"
+        f"📋 РП команди: {count_custom_actions(user_id)}/{user['limit']}\n"
         f"🔓 /upgrade — розширити ліміт (100 монет)"
     )
 
@@ -287,8 +390,8 @@ async def roulette(message: types.Message):
         return
 
     markup = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔴 Червоне", callback_data=f"rl|red|{bet}|{user_id}"),
-        InlineKeyboardButton(text="⚫ Чорне",   callback_data=f"rl|black|{bet}|{user_id}"),
+        InlineKeyboardButton(text="🔴 Червоне",    callback_data=f"rl|red|{bet}|{user_id}"),
+        InlineKeyboardButton(text="⚫ Чорне",      callback_data=f"rl|black|{bet}|{user_id}"),
         InlineKeyboardButton(text="🟢 Зелене x14", callback_data=f"rl|green|{bet}|{user_id}"),
     ]])
     await message.reply(
@@ -368,7 +471,7 @@ async def expand_limit(message: types.Message):
         f"Баланс: {user['balance']} монет"
     )
 
-# ─── ДОДАТИ КОМАНДУ ──────────────────────────
+# ─── ДОДАТИ РП КОМАНДУ ───────────────────────
 
 @dp.message(Command("add"))
 async def add_action_start(message: types.Message, state: FSMContext):
@@ -399,7 +502,6 @@ async def add_action_type(callback: types.CallbackQuery, state: FSMContext):
     action_type = callback.data.split("|")[1]
     await state.update_data(illusion=(action_type == "illusion"))
     await state.set_state(AddAction.waiting_for_data)
-
     type_text = "🎭 Ілюзія вибору" if action_type == "illusion" else "🔀 З вибором"
     await callback.message.edit_text(
         f"Обрано: {type_text}\n\n"
@@ -427,7 +529,6 @@ async def add_action_data(message: types.Message, state: FSMContext):
 
     add_custom_action(user_id, name, past, emoji, illusion)
     await state.clear()
-
     user = get_user(user_id)
     type_text = "🎭 Ілюзія вибору" if illusion else "🔀 З вибором"
     await message.reply(
@@ -435,7 +536,7 @@ async def add_action_data(message: types.Message, state: FSMContext):
         f"Використано: {count_custom_actions(user_id)}/{user['limit']}"
     )
 
-# ─── МОЇ / ВИДАЛИТИ КОМАНДИ ─────────────────
+# ─── МОЇ / ВИДАЛИТИ РП КОМАНДИ ──────────────
 
 @dp.message(Command("my"))
 async def my_actions(message: types.Message):
@@ -448,7 +549,7 @@ async def my_actions(message: types.Message):
         await message.reply("Немає команд. Додай: /add")
         return
 
-    text = f"Твої команди ({len(actions)}/{user['limit']}):\n\n"
+    text = f"Твої РП команди ({len(actions)}/{user['limit']}):\n\n"
     for name, past, emoji, illusion in actions:
         icon = "🎭" if illusion else "🔀"
         text += f"{emoji} {name} → {past} {icon}\n"
@@ -477,6 +578,124 @@ async def delete_action(message: types.Message):
     else:
         await message.reply(f"❌ «{name}» не знайдено.")
 
+# ─── ДОДАТИ TOD ЗАВДАННЯ ─────────────────────
+
+@dp.message(Command("tod_add"))
+async def tod_add_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    ensure_user(user_id)
+    user = get_user(user_id)
+
+    if user["balance"] < 200:
+        await message.reply(
+            f"❌ Потрібно 200 монет\n"
+            f"У тебе: {user['balance']} монет"
+        )
+        return
+
+    await state.set_state(AddTod.waiting_for_type)
+    await message.reply(
+        "Що додати в Правда або Дія?\n\n"
+        "Вартість: 200 монет 💰",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🗣 Питання (Правда)", callback_data="tod_add|truth"),
+            InlineKeyboardButton(text="⚡ Завдання (Дія)",   callback_data="tod_add|dare"),
+        ]])
+    )
+
+@dp.callback_query(F.data.startswith("tod_add|"), AddTod.waiting_for_type)
+async def tod_add_type(callback: types.CallbackQuery, state: FSMContext):
+    task_type = callback.data.split("|")[1]
+    await state.update_data(task_type=task_type)
+    await state.set_state(AddTod.waiting_for_text)
+    type_text = "питання для Правди" if task_type == "truth" else "завдання для Дії"
+    await callback.message.edit_text(
+        f"Напиши своє {type_text}:\n\n"
+        f"⚠️ Проходить модерацію.\n"
+        f"Заклики до самопошкодження будуть відхилені."
+    )
+    await callback.answer()
+
+@dp.message(AddTod.waiting_for_text)
+async def tod_add_text(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    task_type = data.get("task_type")
+    text = message.text.strip()
+
+    if len(text) > 200:
+        await message.reply("❗ Максимум 200 символів!")
+        return
+
+    user = get_user(user_id)
+    if user["balance"] < 200:
+        await message.reply("❌ Недостатньо монет!")
+        await state.clear()
+        return
+
+    checking_msg = await message.reply("🔍 Перевіряємо завдання...")
+    allowed, reason = await moderate_task(text)
+
+    if not allowed:
+        await checking_msg.edit_text(
+            f"❌ Завдання відхилено!\n\n"
+            f"Причина: {reason}\n\n"
+            f"Монети не списані. Спробуй інше: /tod_add"
+        )
+        await state.clear()
+        return
+
+    update_balance(user_id, -200)
+    add_tod_task(user_id, task_type, text)
+    await state.clear()
+
+    type_text = "🗣 Питання" if task_type == "truth" else "⚡ Завдання"
+    new_bal = get_user(user_id)["balance"]
+    await checking_msg.edit_text(
+        f"✅ Додано!\n\n"
+        f"{type_text}: {text}\n\n"
+        f"-200 монет\nБаланс: {new_bal} монет"
+    )
+
+@dp.message(Command("tod_my"))
+async def tod_my(message: types.Message):
+    user_id = message.from_user.id
+    tasks = list_tod_tasks(user_id)
+
+    if not tasks:
+        await message.reply("Немає завдань.\nДодай: /tod_add (200 монет)")
+        return
+
+    text = f"Твої завдання ({len(tasks)}):\n\n"
+    for task_id, task_type, task_text in tasks:
+        icon = "🗣" if task_type == "truth" else "⚡"
+        text += f"{icon} [{task_id}] {task_text}\n\n"
+    text += "Видалити: /tod_delete ID"
+    await message.reply(text)
+
+@dp.message(Command("tod_delete"))
+async def tod_delete(message: types.Message):
+    user_id = message.from_user.id
+    parts = message.text.split()
+
+    if len(parts) < 2 or not parts[1].isdigit():
+        tasks = list_tod_tasks(user_id)
+        if not tasks:
+            await message.reply("Немає завдань.")
+            return
+        text = "Вкажи ID:\n\n"
+        for task_id, task_type, task_text in tasks:
+            icon = "🗣" if task_type == "truth" else "⚡"
+            text += f"{icon} /tod_delete {task_id} — {task_text[:40]}\n"
+        await message.reply(text)
+        return
+
+    task_id = int(parts[1])
+    if delete_tod_task(user_id, task_id):
+        await message.reply(f"✅ Завдання #{task_id} видалено!")
+    else:
+        await message.reply(f"❌ Завдання #{task_id} не знайдено.")
+
 # ─── INLINE QUERY ────────────────────────────
 
 @dp.inline_query()
@@ -486,11 +705,9 @@ async def inline_query(query: types.InlineQuery):
     text = query.query.strip().lower()
     results = []
 
-    # ── Категорія РП ──
+    # ── РП команди ──
     if text.startswith("рп") or text == "":
-        # Прибираємо префікс "рп " щоб отримати уточнення
         detail_text = text[2:].strip() if text.startswith("рп") else ""
-
         all_rp = {**RP_ACTIONS, **get_custom_actions(user.id)}
 
         for code, data in all_rp.items():
@@ -532,33 +749,28 @@ async def inline_query(query: types.InlineQuery):
                 reply_markup=markup
             ))
 
-    # ── Категорія ІГРИ ──
+    # ── Ігри ──
     if text.startswith("гра") or text == "":
-
-        # КНП
         results.append(InlineQueryResultArticle(
             id="game_rps",
             title="✂️ Гра — Камінь Ножиці Папір",
-            description="Зіграти з другом в КНП (+20 монет переможцю)",
+            description="Зіграти з другом (+20 монет переможцю)",
             input_message_content=InputTextMessageContent(
-                message_text=f"✂️ {user.first_name} запрошує пограти в Камінь-Ножиці-Папір!\nОбери свій варіант:"
+                message_text=f"✂️ {user.first_name} запрошує в Камінь-Ножиці-Папір!"
             ),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="🪨 Камінь",  callback_data=f"rps|rock|{user.id}|{short_name}|?"),
-                    InlineKeyboardButton(text="✂️ Ножиці", callback_data=f"rps|scissors|{user.id}|{short_name}|?"),
-                    InlineKeyboardButton(text="📄 Папір",  callback_data=f"rps|paper|{user.id}|{short_name}|?"),
-                ]
-            ])
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🪨 Камінь",  callback_data=f"rps|rock|{user.id}|{short_name}|?"),
+                InlineKeyboardButton(text="✂️ Ножиці", callback_data=f"rps|scissors|{user.id}|{short_name}|?"),
+                InlineKeyboardButton(text="📄 Папір",  callback_data=f"rps|paper|{user.id}|{short_name}|?"),
+            ]])
         ))
 
-        # Правда або дія
         results.append(InlineQueryResultArticle(
             id="game_tod",
             title="🎯 Гра — Правда або Дія",
             description="Запропонувати другу правду або дію",
             input_message_content=InputTextMessageContent(
-                message_text=f"🎯 {user.first_name} запрошує пограти в Правда або Дія!\nОбери:"
+                message_text=f"🎯 {user.first_name} запрошує в Правда або Дія!"
             ),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="🗣 Правда", callback_data=f"tod|truth|{user.id}|{short_name}"),
@@ -567,7 +779,7 @@ async def inline_query(query: types.InlineQuery):
         ))
 
     # ── Баланс ──
-    if text == "" or text == "баланс":
+    if text == "" or "баланс" in text:
         results.append(InlineQueryResultArticle(
             id="b",
             title="💰 Мій баланс",
@@ -617,7 +829,6 @@ async def rp_callback(callback: types.CallbackQuery):
         await callback.answer("⛔ Ця дія адресована іншій людині!", show_alert=True)
         return
 
-    # Знімаємо префікс rp_ з коду
     clean_code = code.replace("rp_", "") if code.startswith("rp_") else code
     data = RP_ACTIONS.get(clean_code)
     if not data:
@@ -626,26 +837,27 @@ async def rp_callback(callback: types.CallbackQuery):
         c.execute("SELECT name, past, emoji, illusion FROM custom_actions WHERE code = ?", (clean_code,))
         row = c.fetchone()
         conn.close()
-        data = {"name": row[0], "past": row[1], "emoji": row[2], "prep": "", "illusion": bool(row[3])} if row else {"emoji": "✨", "past": clean_code, "name": clean_code, "prep": ""}
+        data = {"name": row[0], "past": row[1], "emoji": row[2], "prep": "", "illusion": bool(row[3])} if row else {"emoji": "✨", "past": clean_code, "name": clean_code, "prep": "", "illusion": False}
 
     emoji = data["emoji"]
     past = data["past"]
     prep = data["prep"]
+    is_illusion = data.get("illusion", False)
     responder_name = callback.from_user.first_name
     detail = pending_details.get(callback.inline_message_id, "")
     detail_text = f" {prep}{detail}" if detail else ""
 
     if result == "a":
-        # Для ілюзії вибору — результат робить той хто натиснув (responder)
-        is_illusion = data.get("illusion", False)
         if is_illusion:
-            text = f"{emoji} {responder_name} {past}{detail_text}! ✅"
+            final_text = f"{emoji} {responder_name} {past}{detail_text}! ✅"
         else:
-            text = f"{emoji} {initiator_name} {past} {responder_name}{detail_text}! ✅"
+            final_text = f"{emoji} {initiator_name} {past} {responder_name}{detail_text}! ✅"
         await bot.edit_message_text(
             inline_message_id=callback.inline_message_id,
-            text=text
+            text=final_text
         )
+        await callback.answer("✅ Прийнято!")
+        pending_details.pop(callback.inline_message_id, None)
     elif result == "d":
         await bot.edit_message_text(
             inline_message_id=callback.inline_message_id,
@@ -654,7 +866,7 @@ async def rp_callback(callback: types.CallbackQuery):
         await callback.answer("Ти відхилив(ла).")
         pending_details.pop(callback.inline_message_id, None)
 
-# ─── КНП КНОПКИ ──────────────────────────────
+# ─── КНП ─────────────────────────────────────
 
 RPS_WINS = {
     "rock":     {"scissors": True,  "paper": False, "rock": None},
@@ -674,33 +886,17 @@ async def rps_callback(callback: types.CallbackQuery):
     if msg_id not in rps_games:
         rps_games[msg_id] = {}
 
-    # Перший гравець — ініціатор
-    if callback.from_user.id == initiator_id:
-        if initiator_id in rps_games[msg_id]:
-            await callback.answer("Ти вже обрав!", show_alert=True)
-            return
-        rps_games[msg_id][initiator_id] = {
-            "choice": choice,
-            "name": initiator_name
-        }
-        await callback.answer(f"Ти обрав {RPS_EMOJI[choice]} {RPS_NAME[choice]}! Чекаємо суперника...")
-    else:
-        # Другий гравець
-        p2_id = callback.from_user.id
-        if p2_id in rps_games[msg_id]:
-            await callback.answer("Ти вже обрав!", show_alert=True)
-            return
-        if p2_id == initiator_id:
-            await callback.answer("Не можна грати з собою!", show_alert=True)
-            return
+    p_id = callback.from_user.id
+    if p_id in rps_games[msg_id]:
+        await callback.answer("Ти вже обрав!", show_alert=True)
+        return
 
-        rps_games[msg_id][p2_id] = {
-            "choice": choice,
-            "name": callback.from_user.first_name
-        }
-        await callback.answer(f"Ти обрав {RPS_EMOJI[choice]} {RPS_NAME[choice]}!")
+    rps_games[msg_id][p_id] = {
+        "choice": choice,
+        "name": callback.from_user.first_name
+    }
+    await callback.answer(f"Ти обрав {RPS_EMOJI[choice]}! Чекаємо суперника...")
 
-    # Якщо обидва обрали — показуємо результат
     if len(rps_games[msg_id]) == 2:
         players = list(rps_games[msg_id].items())
         p1_id, p1_data = players[0]
@@ -736,29 +932,10 @@ async def rps_callback(callback: types.CallbackQuery):
                 f"🏆 Переміг {p2_name}! +20 монет"
             )
 
-        await bot.edit_message_text(
-            inline_message_id=msg_id,
-            text=text
-        )
+        await bot.edit_message_text(inline_message_id=msg_id, text=text)
         rps_games.pop(msg_id, None)
 
 # ─── ПРАВДА АБО ДІЯ ──────────────────────────
-
-TOD_TRUTHS = [
-    "Яка твоя найбільша таємниця?",
-    "Кого з присутніх ти вважаєш найрозумнішим?",
-    "Що ти ніколи не скажеш батькам?",
-    "Твій найбільш незручний момент?",
-    "Яка твоя найстрашніша фобія?",
-]
-
-TOD_DARES = [
-    "Напиши повідомлення першому контакту в телефоні",
-    "Зроби 10 присідань прямо зараз",
-    "Напиши щось смішне на своїй сторінці",
-    "Розкажи анекдот",
-    "Проспівай будь-яку пісню",
-]
 
 @dp.callback_query(F.data.startswith("tod|"))
 async def tod_callback(callback: types.CallbackQuery):
@@ -767,20 +944,19 @@ async def tod_callback(callback: types.CallbackQuery):
     initiator_id = int(initiator_id)
     msg_id = callback.inline_message_id
 
-    # Ініціатор не може обирати сам
     if callback.from_user.id == initiator_id:
         await callback.answer("🙃 Дай другу обрати!", show_alert=True)
         return
 
     responder_name = callback.from_user.first_name
     responder_id = callback.from_user.id
+    task_type = "truth" if choice == "truth" else "dare"
+    task_icon = "🗣 Правда" if choice == "truth" else "⚡ Дія"
 
-    if choice == "truth":
-        task = random.choice(TOD_TRUTHS)
-        task_type = "🗣 Правда"
-    else:
-        task = random.choice(TOD_DARES)
-        task_type = "⚡ Дія"
+    standard = TOD_TRUTHS if choice == "truth" else TOD_DARES
+    custom = get_tod_tasks(task_type)
+    all_tasks = standard + custom
+    task = random.choice(all_tasks)
 
     tod_games[msg_id] = {
         "initiator_id": initiator_id,
@@ -788,14 +964,14 @@ async def tod_callback(callback: types.CallbackQuery):
         "responder_id": responder_id,
         "responder_name": responder_name,
         "task": task,
-        "type": task_type
+        "type": task_icon
     }
 
     await bot.edit_message_text(
         inline_message_id=msg_id,
         text=(
-            f"🎯 {responder_name} обрав(ла) {task_type}!\n\n"
-            f"📋 Завдання:\n{task}\n\n"
+            f"🎯 {responder_name} обрав(ла) {task_icon}!\n\n"
+            f"📋 {task}\n\n"
             f"Очікуємо підтвердження від {initiator_name}..."
         ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -815,7 +991,6 @@ async def tod_done_callback(callback: types.CallbackQuery):
         await callback.answer("Гра вже завершена!", show_alert=True)
         return
 
-    # Тільки ініціатор може підтвердити
     if callback.from_user.id != game["initiator_id"]:
         await callback.answer("⛔ Тільки той хто запропонував може підтвердити!", show_alert=True)
         return
@@ -826,10 +1001,9 @@ async def tod_done_callback(callback: types.CallbackQuery):
             inline_message_id=msg_id,
             text=(
                 f"🎯 Правда або Дія\n\n"
-                f"{game['responder_name']} обрав(ла) {game['type']}\n"
+                f"{game['responder_name']} — {game['type']}\n"
                 f"📋 {game['task']}\n\n"
-                f"✅ {game['initiator_name']} підтвердив виконання!\n"
-                f"+15 монет для {game['responder_name']} 🎉"
+                f"✅ Виконано! +15 монет для {game['responder_name']} 🎉"
             )
         )
         await callback.answer("✅ Підтверджено!")
@@ -838,12 +1012,12 @@ async def tod_done_callback(callback: types.CallbackQuery):
             inline_message_id=msg_id,
             text=(
                 f"🎯 Правда або Дія\n\n"
-                f"{game['responder_name']} обрав(ла) {game['type']}\n"
+                f"{game['responder_name']} — {game['type']}\n"
                 f"📋 {game['task']}\n\n"
-                f"❌ {game['responder_name']} відмовився(лась) від завдання!"
+                f"❌ {game['responder_name']} відмовився(лась)!"
             )
         )
-        await callback.answer("❌ Відмову зафіксовано.")
+        await callback.answer("❌ Зафіксовано.")
 
     tod_games.pop(msg_id, None)
 
